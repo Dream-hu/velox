@@ -28,6 +28,7 @@ add_library(
   velox_expression
   BooleanMix.cpp
   CastExpr.cpp
+  CastHooks.cpp
   CoalesceExpr.cpp
   ConjunctExpr.cpp
   ConstantExpr.cpp
@@ -50,14 +51,19 @@ add_library(
   VectorFunction.cpp)
 
 target_link_libraries(
-  velox_expression velox_core velox_vector velox_common_base
-  velox_expression_functions velox_functions_util)
+  velox_expression
+  velox_core
+  velox_vector
+  velox_common_base
+  velox_expression_functions
+  velox_functions_util
+  double-conversion::double-conversion
+  Folly::folly)
 
 add_subdirectory(type_calculation)
 add_subdirectory(signature_parser)
 
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
-elseif(${VELOX_BUILD_TEST_UTILS})
-  add_subdirectory(tests/utils)
+  add_subdirectory(fuzzer)
 endif()

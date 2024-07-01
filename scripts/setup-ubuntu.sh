@@ -35,11 +35,12 @@ source $SCRIPTDIR/setup-helper-functions.sh
 CPU_TARGET="${CPU_TARGET:-avx}"
 COMPILER_FLAGS=$(get_cxx_flags "$CPU_TARGET")
 export COMPILER_FLAGS
-FB_OS_VERSION=v2024.04.01.00
+FB_OS_VERSION=v2024.05.20.00
 FMT_VERSION=10.1.1
 BOOST_VERSION=boost-1.84.0
 NPROC=$(getconf _NPROCESSORS_ONLN)
 DEPENDENCY_DIR=${DEPENDENCY_DIR:-$(pwd)}
+BUILD_DUCKDB="${BUILD_DUCKDB:-true}"
 export CMAKE_BUILD_TYPE=Release
 SUDO="${SUDO:-"sudo --preserve-env"}"
 
@@ -51,12 +52,16 @@ function install_build_prerequisites {
   ${SUDO} apt install -y libunwind-dev
   ${SUDO} apt install -y \
     build-essential \
-    cmake \
+    python3-pip \
     ccache \
+    curl \
     ninja-build \
     checkinstall \
     git \
     wget
+
+    # Install to /usr/local to make it available to all users.
+    ${SUDO} pip3 install cmake==3.28.3
 }
 
 # Install packages required for build.
@@ -125,7 +130,7 @@ function install_fbthrift {
 }
 
 function install_conda {
-  MINICONDA_PATH=/opt/miniconda-for-velox
+  MINICONDA_PATH="${HOME:-/opt}/miniconda-for-velox"
   if [ -e ${MINICONDA_PATH} ]; then
     echo "File or directory already exists: ${MINICONDA_PATH}"
     return
@@ -137,8 +142,42 @@ function install_conda {
   fi
 
   mkdir -p conda && cd conda
-  wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-$ARCH.sh
+  wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-$ARCH.sh -O Miniconda3-latest-Linux-$ARCH.sh
   bash Miniconda3-latest-Linux-$ARCH.sh -b -p $MINICONDA_PATH
+}
+
+function install_duckdb {
+  if $BUILD_DUCKDB ; then
+    echo 'Building DuckDB'
+    wget_and_untar https://github.com/duckdb/duckdb/archive/refs/tags/v0.8.1.tar.gz duckdb
+    (
+      cd duckdb
+      cmake_install -DBUILD_UNITTESTS=OFF -DENABLE_SANITIZER=OFF -DENABLE_UBSAN=OFF -DBUILD_SHELL=OFF -DEXPORT_DLL_SYMBOLS=OFF -DCMAKE_BUILD_TYPE=Release
+    )
+  fi
+}
+
+ARROW_VERSION=15.0.0
+
+function install_arrow {
+  wget_and_untar https://archive.apache.org/dist/arrow/arrow-${ARROW_VERSION}/apache-arrow-${ARROW_VERSION}.tar.gz arrow
+  cd arrow/cpp
+  cmake_install \
+    -DARROW_PARQUET=OFF \
+    -DARROW_WITH_THRIFT=ON \
+    -DARROW_WITH_LZ4=ON \
+    -DARROW_WITH_SNAPPY=ON \
+    -DARROW_WITH_ZLIB=ON \
+    -DARROW_WITH_ZSTD=ON \
+    -DARROW_JEMALLOC=OFF \
+    -DARROW_SIMD_LEVEL=NONE \
+    -DARROW_RUNTIME_SIMD_LEVEL=NONE \
+    -DARROW_WITH_UTF8PROC=OFF \
+    -DARROW_TESTING=ON \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DARROW_BUILD_STATIC=ON \
+    -DThrift_SOURCE=BUNDLED
 }
 
 function install_cuda {
@@ -162,6 +201,8 @@ function install_velox_deps {
   run_and_time install_mvfst
   run_and_time install_fbthrift
   run_and_time install_conda
+  run_and_time install_duckdb
+  run_and_time install_arrow
 }
 
 function install_apt_deps {

@@ -34,11 +34,20 @@ add_test(velox_dwio_dwrf_buffered_output_stream_test
 target_link_libraries(velox_dwio_dwrf_buffered_output_stream_test
                       velox_link_libs Folly::folly ${TEST_LINK_LIBS})
 
-add_executable(velox_dwio_dwrf_column_statistics_test TestColumnStatistics.cpp)
+add_executable(velox_dwio_dwrf_column_statistics_test
+               TestDwrfColumnStatistics.cpp)
 add_test(velox_dwio_dwrf_column_statistics_test
          velox_dwio_dwrf_column_statistics_test)
 
 target_link_libraries(velox_dwio_dwrf_column_statistics_test velox_link_libs
+                      Folly::folly ${TEST_LINK_LIBS})
+
+add_executable(velox_dwio_orc_column_statistics_test
+               TestOrcColumnStatistics.cpp)
+add_test(velox_dwio_orc_column_statistics_test
+         velox_dwio_orc_column_statistics_test)
+
+target_link_libraries(velox_dwio_orc_column_statistics_test velox_link_libs
                       Folly::folly ${TEST_LINK_LIBS})
 
 add_executable(velox_dwio_dwrf_compression_test CompressionTest.cpp)
@@ -346,7 +355,7 @@ add_test(velox_dwrf_e2e_filter_test velox_dwrf_e2e_filter_test)
 
 target_link_libraries(
   velox_dwrf_e2e_filter_test
-  velox_e2e_filter_test_base
+  velox_dwio_common_test_utils
   velox_link_libs
   velox_test_util
   Folly::folly

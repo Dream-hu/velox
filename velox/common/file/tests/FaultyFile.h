@@ -87,13 +87,13 @@ struct FaultFileReadvOperation : FaultFileOperation {
 
 /// Fault injection parameters for file write API.
 struct FaultFileWriteOperation : FaultFileOperation {
-  std::string_view data;
+  std::string_view* data;
 
   FaultFileWriteOperation(
       const std::string& _path,
       const std::string_view& _data)
       : FaultFileOperation(FaultFileOperation::Type::kWrite, _path),
-        data(_data) {}
+        data(const_cast<std::string_view*>(&_data)) {}
 };
 
 /// The fault injection hook on the file operation path.
@@ -104,7 +104,8 @@ class FaultyReadFile : public ReadFile {
   FaultyReadFile(
       const std::string& path,
       std::shared_ptr<ReadFile> delegatedFile,
-      FileFaultInjectionHook injectionHook);
+      FileFaultInjectionHook injectionHook,
+      folly::Executor* executor);
 
   ~FaultyReadFile() override{};
 
@@ -135,10 +136,22 @@ class FaultyReadFile : public ReadFile {
     return delegatedFile_->getNaturalReadSize();
   }
 
+  bool hasPreadvAsync() const override {
+    if (executor_ != nullptr) {
+      return true;
+    }
+    return delegatedFile_->hasPreadvAsync();
+  }
+
+  folly::SemiFuture<uint64_t> preadvAsync(
+      uint64_t offset,
+      const std::vector<folly::Range<char*>>& buffers) const override;
+
  private:
   const std::string path_;
   const std::shared_ptr<ReadFile> delegatedFile_;
   const FileFaultInjectionHook injectionHook_;
+  folly::Executor* const executor_;
 };
 
 class FaultyWriteFile : public WriteFile {

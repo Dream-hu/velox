@@ -30,12 +30,14 @@ namespace date {
 class time_zone;
 }
 
+enum class TimestampPrecision : int8_t {
+  kMilliseconds = 3, // 10^3 milliseconds are equal to one second.
+  kMicroseconds = 6, // 10^6 microseconds are equal to one second.
+  kNanoseconds = 9, // 10^9 nanoseconds are equal to one second.
+};
+
 struct TimestampToStringOptions {
-  enum class Precision : int8_t {
-    kMilliseconds = 3, // 10^3 milliseconds are equal to one second.
-    kMicroseconds = 6, // 10^6 microseconds are equal to one second.
-    kNanoseconds = 9, // 10^9 nanoseconds are equal to one second.
-  };
+  using Precision = TimestampPrecision;
 
   Precision precision = Precision::kNanoseconds;
 
@@ -187,7 +189,7 @@ struct Timestamp {
   /// Due to the limit of std::chrono, throws if timestamp is outside of
   /// [-32767-01-01, 32767-12-31] range.
   /// If allowOverflow is true, integer overflow is allowed in converting
-  /// timestmap to milliseconds.
+  /// timestamp to milliseconds.
   std::chrono::time_point<std::chrono::system_clock, std::chrono::milliseconds>
   toTimePoint(bool allowOverflow = false) const;
 
@@ -216,6 +218,21 @@ struct Timestamp {
   }
 
   static Timestamp fromMicros(int64_t micros) {
+    if (micros >= 0 || micros % 1'000'000 == 0) {
+      return Timestamp(micros / 1'000'000, (micros % 1'000'000) * 1'000);
+    }
+    auto second = micros / 1'000'000 - 1;
+    auto nano = ((micros - second * 1'000'000) % 1'000'000) * 1'000;
+    return Timestamp(second, nano);
+  }
+
+  static Timestamp fromMicrosNoError(int64_t micros)
+#if defined(__has_feature)
+#if __has_feature(__address_sanitizer__)
+      __attribute__((__no_sanitize__("signed-integer-overflow")))
+#endif
+#endif
+  {
     if (micros >= 0 || micros % 1'000'000 == 0) {
       return Timestamp(micros / 1'000'000, (micros % 1'000'000) * 1'000);
     }
@@ -265,7 +282,13 @@ struct Timestamp {
   /// concurrency (71% of time is on __tz_convert for some queries).
   ///
   /// Return whether the epoch second can be converted to a valid std::tm.
-  static bool epochToUtc(int64_t seconds, std::tm& out);
+  static bool epochToCalendarUtc(int64_t seconds, std::tm& out);
+
+  /// Our own version of timegm to avoid expensive calls to __tz_convert.
+  ///
+  /// This function is guaranteed to give same result as std::timegm when it is
+  /// successful.
+  static int64_t calendarUtcToEpoch(const std::tm& tm);
 
   /// Converts a std::tm to a time/date/timestamp string in ISO 8601 format
   /// according to TimestampToStringOptions.
@@ -296,12 +319,14 @@ struct Timestamp {
   // Same as above, but accepts PrestoDB time zone ID.
   void toGMT(int16_t tzID);
 
-  // Assuming the timestamp represents a GMT time, converts it to the time at
-  // the same moment at zone.
-  // Example: Timestamp ts{0, 0};
-  // ts.Timezone("America/Los_Angeles");
-  // ts.toString() returns December 31, 1969 16:00:00
-  void toTimezone(const date::time_zone& zone);
+  /// Assuming the timestamp represents a GMT time, converts it to the time at
+  /// the same moment at zone.
+  /// @param allowOverflow If true, integer overflow is allowed when converting
+  /// timestamp to TimePoint. Otherwise, user exception is thrown for overflow.
+  /// Example: Timestamp ts{0, 0};
+  /// ts.Timezone("America/Los_Angeles");
+  /// ts.toString() returns December 31, 1969 16:00:00
+  void toTimezone(const date::time_zone& zone, bool allowOverflow = false);
 
   // Same as above, but accepts PrestoDB time zone ID.
   void toTimezone(int16_t tzID);
@@ -371,7 +396,7 @@ struct Timestamp {
   std::string toString(const TimestampToStringOptions& options = {}) const {
     std::tm tm;
     VELOX_USER_CHECK(
-        epochToUtc(seconds_, tm),
+        epochToCalendarUtc(seconds_, tm),
         "Can't convert seconds to time: {}",
         seconds_);
     std::string result;
@@ -394,6 +419,11 @@ struct Timestamp {
     obj["seconds"] = seconds_;
     obj["nanos"] = nanos_;
     return obj;
+  }
+
+  // Pretty printer for gtest.
+  friend void PrintTo(const Timestamp& timestamp, std::ostream* os) {
+    *os << "sec: " << timestamp.seconds_ << ", ns: " << timestamp.nanos_;
   }
 
  private:

@@ -18,13 +18,17 @@
 #include "velox/expression/RegisterSpecialForm.h"
 #include "velox/expression/RowConstructor.h"
 #include "velox/expression/SpecialFormRegistry.h"
+#include "velox/functions/lib/ArrayShuffle.h"
 #include "velox/functions/lib/IsNull.h"
 #include "velox/functions/lib/Re2Functions.h"
 #include "velox/functions/lib/RegistrationHelpers.h"
 #include "velox/functions/lib/Repeat.h"
 #include "velox/functions/prestosql/ArrayFunctions.h"
+#include "velox/functions/prestosql/BinaryFunctions.h"
 #include "velox/functions/prestosql/DateTimeFunctions.h"
 #include "velox/functions/prestosql/StringFunctions.h"
+#include "velox/functions/prestosql/URLFunctions.h"
+#include "velox/functions/sparksql/ArrayFlattenFunction.h"
 #include "velox/functions/sparksql/ArrayMinMaxFunction.h"
 #include "velox/functions/sparksql/ArraySort.h"
 #include "velox/functions/sparksql/Bitwise.h"
@@ -93,6 +97,18 @@ static void workAroundRegistrationMacro(const std::string& prefix) {
   VELOX_REGISTER_VECTOR_FUNCTION(udf_array_contains, prefix + "array_contains");
   VELOX_REGISTER_VECTOR_FUNCTION(
       udf_array_intersect, prefix + "array_intersect");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_array_distinct, prefix + "array_distinct");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_array_except, prefix + "array_except");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_array_position, prefix + "array_position");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_zip_with, prefix + "zip_with");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_all_match, prefix + "forall");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_any_match, prefix + "exists");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_zip, prefix + "arrays_zip");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_map_entries, prefix + "map_entries");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_map_keys, prefix + "map_keys");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_map_values, prefix + "map_values");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_map_zip_with, prefix + "map_zip_with");
+
   // This is the semantics of spark.sql.ansi.enabled = false.
   registerElementAtFunction(prefix + "element_at", true);
 
@@ -104,6 +120,7 @@ static void workAroundRegistrationMacro(const std::string& prefix) {
   VELOX_REGISTER_VECTOR_FUNCTION(udf_concat, prefix + "concat");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_lower, prefix + "lower");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_upper, prefix + "upper");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_reverse, prefix + "reverse");
   // Logical.
   VELOX_REGISTER_VECTOR_FUNCTION(udf_not, prefix + "not");
   registerIsNullFunction(prefix + "isnull");
@@ -218,11 +235,18 @@ void registerFunctions(const std::string& prefix) {
       {prefix + "sha1"});
   registerFunction<Sha2HexStringFunction, Varchar, Varbinary, int32_t>(
       {prefix + "sha2"});
+  registerFunction<CRC32Function, int64_t, Varbinary>({prefix + "crc32"});
 
   exec::registerStatefulVectorFunction(
       prefix + "regexp_extract", re2ExtractSignatures(), makeRegexExtract);
   exec::registerStatefulVectorFunction(
+      prefix + "regexp_extract_all",
+      re2ExtractAllSignatures(),
+      makeRe2ExtractAll);
+  exec::registerStatefulVectorFunction(
       prefix + "rlike", re2SearchSignatures(), makeRLike);
+  exec::registerStatefulVectorFunction(
+      prefix + "like", likeSignatures(), makeLike);
   VELOX_REGISTER_VECTOR_FUNCTION(udf_regexp_split, prefix + "split");
 
   exec::registerStatefulVectorFunction(
@@ -296,6 +320,11 @@ void registerFunctions(const std::string& prefix) {
   registerFunction<FindInSetFunction, int32_t, Varchar, Varchar>(
       {prefix + "find_in_set"});
 
+  registerFunction<UrlEncodeFunction, Varchar, Varchar>(
+      {prefix + "url_encode"});
+  registerFunction<UrlDecodeFunction, Varchar, Varchar>(
+      {prefix + "url_decode"});
+
   // Register array sort functions.
   exec::registerStatefulVectorFunction(
       prefix + "array_sort", arraySortSignatures(), makeArraySort);
@@ -308,11 +337,21 @@ void registerFunctions(const std::string& prefix) {
       makeRepeatAllowNegativeCount,
       repeatMetadata());
 
+  exec::registerStatefulVectorFunction(
+      prefix + "shuffle",
+      arrayShuffleWithCustomSeedSignatures(),
+      makeArrayShuffleWithCustomSeed,
+      getMetadataForArrayShuffle());
+
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_array_get, prefix + "get");
+
   // Register date functions.
   registerFunction<YearFunction, int32_t, Timestamp>({prefix + "year"});
   registerFunction<YearFunction, int32_t, Date>({prefix + "year"});
   registerFunction<WeekFunction, int32_t, Timestamp>({prefix + "week_of_year"});
   registerFunction<WeekFunction, int32_t, Date>({prefix + "week_of_year"});
+  registerFunction<YearOfWeekFunction, int32_t, Date>(
+      {prefix + "year_of_week"});
 
   registerFunction<ToUtcTimestampFunction, Timestamp, Timestamp, Varchar>(
       {prefix + "to_utc_timestamp"});
@@ -320,6 +359,9 @@ void registerFunctions(const std::string& prefix) {
       {prefix + "from_utc_timestamp"});
 
   registerFunction<UnixDateFunction, int32_t, Date>({prefix + "unix_date"});
+
+  registerFunction<UnixSecondsFunction, int64_t, Timestamp>(
+      {prefix + "unix_seconds"});
 
   registerFunction<UnixTimestampFunction, int64_t>({prefix + "unix_timestamp"});
 
@@ -384,6 +426,15 @@ void registerFunctions(const std::string& prefix) {
 
   VELOX_REGISTER_VECTOR_FUNCTION(udf_make_timestamp, prefix + "make_timestamp");
 
+  registerFunction<TimestampToMicrosFunction, int64_t, Timestamp>(
+      {prefix + "unix_micros"});
+  registerUnaryIntegralWithTReturn<MicrosToTimestampFunction, Timestamp>(
+      {prefix + "timestamp_micros"});
+  registerFunction<TimestampToMillisFunction, int64_t, Timestamp>(
+      {prefix + "unix_millis"});
+  registerUnaryIntegralWithTReturn<MillisToTimestampFunction, Timestamp>(
+      {prefix + "timestamp_millis"});
+
   // Register bloom filter function
   registerFunction<BloomFilterMightContainFunction, bool, Varbinary, int64_t>(
       {prefix + "might_contain"});
@@ -403,6 +454,13 @@ void registerFunctions(const std::string& prefix) {
       {prefix + "monotonically_increasing_id"});
 
   registerFunction<UuidFunction, Varchar, Constant<int64_t>>({prefix + "uuid"});
+
+  registerFunction<
+      ArrayFlattenFunction,
+      Array<Generic<T1>>,
+      Array<Array<Generic<T1>>>>({prefix + "flatten"});
+
+  registerFunction<SoundexFunction, Varchar, Varchar>({prefix + "soundex"});
 }
 
 } // namespace sparksql

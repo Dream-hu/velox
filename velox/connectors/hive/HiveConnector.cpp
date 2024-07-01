@@ -21,6 +21,9 @@
 #include "velox/connectors/hive/HiveDataSink.h"
 #include "velox/connectors/hive/HiveDataSource.h"
 #include "velox/connectors/hive/HivePartitionFunction.h"
+#include "velox/dwio/dwrf/RegisterDwrfReader.h"
+#include "velox/dwio/dwrf/RegisterDwrfWriter.h"
+
 // Meta's buck build system needs this check.
 #ifdef VELOX_ENABLE_GCS
 #include "velox/connectors/hive/storage_adapters/gcs/RegisterGCSFileSystem.h" // @manual
@@ -36,6 +39,7 @@
 #endif
 #include "velox/dwio/dwrf/reader/DwrfReader.h"
 #include "velox/dwio/dwrf/writer/Writer.h"
+#include "velox/dwio/orc/reader/OrcReader.h"
 // Meta's buck build system needs this check.
 #ifdef VELOX_ENABLE_PARQUET
 #include "velox/dwio/parquet/RegisterParquetReader.h" // @manual
@@ -59,8 +63,7 @@ HiveConnector::HiveConnector(
       hiveConfig_(std::make_shared<HiveConfig>(config)),
       fileHandleFactory_(
           hiveConfig_->isFileHandleCacheEnabled()
-              ? std::make_unique<
-                    SimpleLRUCache<std::string, std::shared_ptr<FileHandle>>>(
+              ? std::make_unique<SimpleLRUCache<std::string, FileHandle>>(
                     hiveConfig_->numCacheFileHandles())
               : nullptr,
           std::make_unique<FileHandleGenerator>(config)),
@@ -134,6 +137,7 @@ void HiveConnectorFactory::initialize() {
     dwio::common::registerFileSinks();
     dwrf::registerDwrfReaderFactory();
     dwrf::registerDwrfWriterFactory();
+    orc::registerOrcReaderFactory();
 // Meta's buck build system needs this check.
 #ifdef VELOX_ENABLE_PARQUET
     parquet::registerParquetReaderFactory();

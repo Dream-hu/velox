@@ -39,6 +39,12 @@ class DuckQueryRunner : public ReferenceQueryRunner {
       const std::vector<RowVectorPtr>& input,
       const RowTypePtr& resultType) override;
 
+  std::multiset<std::vector<velox::variant>> execute(
+      const std::string& sql,
+      const std::vector<RowVectorPtr>& probeInput,
+      const std::vector<RowVectorPtr>& buildInput,
+      const RowTypePtr& resultType) override;
+
  private:
   std::optional<std::string> toSql(
       const std::shared_ptr<const core::AggregationNode>& aggregationNode);
@@ -48,6 +54,15 @@ class DuckQueryRunner : public ReferenceQueryRunner {
 
   std::optional<std::string> toSql(
       const std::shared_ptr<const core::ProjectNode>& projectNode);
+
+  std::optional<std::string> toSql(
+      const std::shared_ptr<const core::RowNumberNode>& rowNumberNode);
+
+  std::optional<std::string> toSql(
+      const std::shared_ptr<const core::HashJoinNode>& joinNode);
+
+  std::optional<std::string> toSql(
+      const std::shared_ptr<const core::NestedLoopJoinNode>& joinNode);
 
   std::unordered_set<std::string> aggregateFunctionNames_;
 };

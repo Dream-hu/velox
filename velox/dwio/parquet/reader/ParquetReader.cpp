@@ -16,6 +16,7 @@
 
 #include "velox/dwio/parquet/reader/ParquetReader.h"
 
+#include <boost/algorithm/string.hpp>
 #include <thrift/protocol/TCompactProtocol.h> //@manual
 
 #include "velox/dwio/parquet/reader/ParquetColumnReader.h"
@@ -23,8 +24,6 @@
 #include "velox/dwio/parquet/thrift/ThriftTransport.h"
 
 namespace facebook::velox::parquet {
-
-using dwio::common::ColumnSelector;
 
 /// Metadata and options for reading Parquet.
 class ReaderBase {
@@ -64,7 +63,11 @@ class ReaderBase {
   }
 
   bool isFileColumnNamesReadAsLowerCase() const {
-    return options_.isFileColumnNamesReadAsLowerCase();
+    return options_.fileColumnNamesReadAsLowerCase();
+  }
+
+  const date::time_zone* sessionTimezone() const {
+    return options_.getSessionTimezone();
   }
 
   /// Ensures that streams are enqueued and loading for the row group at
@@ -126,9 +129,9 @@ class ReaderBase {
 ReaderBase::ReaderBase(
     std::unique_ptr<dwio::common::BufferedInput> input,
     const dwio::common::ReaderOptions& options)
-    : pool_{options.getMemoryPool()},
-      footerEstimatedSize_{options.getFooterEstimatedSize()},
-      filePreloadThreshold_{options.getFilePreloadThreshold()},
+    : pool_{options.memoryPool()},
+      footerEstimatedSize_{options.footerEstimatedSize()},
+      filePreloadThreshold_{options.filePreloadThreshold()},
       options_{options},
       input_{std::move(input)},
       fileLength_{input_->getReadFile()->size()} {
@@ -161,8 +164,8 @@ void ReaderBase::loadFileMetaData() {
       strncmp(copy.data() + readSize - 4, "PAR1", 4) == 0,
       "No magic bytes found at end of the Parquet file");
 
-  uint32_t footerLength =
-      *(reinterpret_cast<const uint32_t*>(copy.data() + readSize - 8));
+  uint32_t footerLength;
+  std::memcpy(&footerLength, copy.data() + readSize - 8, sizeof(uint32_t));
   VELOX_CHECK_LE(footerLength + 12, fileLength_);
   int32_t footerOffsetInBuffer = readSize - 8 - footerLength;
   if (footerLength > readSize - 8) {
@@ -235,6 +238,8 @@ std::unique_ptr<ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
   auto& schema = fileMetaData_->schema;
   uint32_t curSchemaIdx = schemaIdx;
   auto& schemaElement = schema[curSchemaIdx];
+  bool isRepeated = false;
+  bool isOptional = false;
 
   if (schemaElement.__isset.repetition_type) {
     if (schemaElement.repetition_type !=
@@ -244,6 +249,11 @@ std::unique_ptr<ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
     if (schemaElement.repetition_type ==
         thrift::FieldRepetitionType::REPEATED) {
       maxRepeat++;
+      isRepeated = true;
+    }
+    if (schemaElement.repetition_type ==
+        thrift::FieldRepetitionType::OPTIONAL) {
+      isOptional = true;
     }
   }
 
@@ -300,7 +310,9 @@ std::unique_ptr<ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
                 std::nullopt,
                 std::nullopt,
                 maxRepeat,
-                maxDefine);
+                maxDefine,
+                isOptional,
+                isRepeated);
           }
 
           // For backward-compatibility, a group annotated with MAP_KEY_VALUE
@@ -313,6 +325,12 @@ std::unique_ptr<ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
           VELOX_CHECK_EQ(children.size(), 1);
           const auto& child = children[0];
           auto type = child->type();
+          isRepeated = true;
+          // This level will not have the "isRepeated" info in the parquet
+          // schema since parquet schema will have a child layer which will have
+          // the "repeated info" which we are ignoring here, hence we set the
+          // isRepeated to true eg
+          // https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#lists
           return std::make_unique<ParquetTypeWithId>(
               std::move(type),
               std::move(*(ParquetTypeWithId*)child.get()).moveChildren(),
@@ -323,7 +341,9 @@ std::unique_ptr<ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
               std::nullopt,
               std::nullopt,
               maxRepeat + 1,
-              maxDefine);
+              maxDefine,
+              isOptional,
+              isRepeated);
         }
 
         default:
@@ -343,18 +363,68 @@ std::unique_ptr<ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
           // also an indication of this is a list type
           // child of LIST
           VELOX_CHECK_GE(children.size(), 1);
-          auto type = TypeFactory<TypeKind::ARRAY>::create(children[0]->type());
-          return std::make_unique<ParquetTypeWithId>(
-              std::move(type),
-              std::move(children),
-              curSchemaIdx,
-              maxSchemaElementIdx,
-              ParquetTypeWithId::kNonLeaf, // columnIdx,
-              std::move(name),
-              std::nullopt,
-              std::nullopt,
-              maxRepeat,
-              maxDefine);
+          if (children.size() == 1 && name != "array" &&
+              name != schema[parentSchemaIdx].name + "_tuple") {
+            auto type =
+                TypeFactory<TypeKind::ARRAY>::create(children[0]->type());
+            return std::make_unique<ParquetTypeWithId>(
+                std::move(type),
+                std::move(children),
+                curSchemaIdx,
+                maxSchemaElementIdx,
+                ParquetTypeWithId::kNonLeaf, // columnIdx,
+                std::move(name),
+                std::nullopt,
+                std::nullopt,
+                maxRepeat,
+                maxDefine,
+                isOptional,
+                isRepeated);
+          } else {
+            // According to the spec of list backward compatibility
+            // https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#lists
+            // "If the repeated field is a group with multiple fields, then its
+            // type is the element type and elements are required." when there
+            // are multiple fields, creating a new row type instance which has
+            // all the fields as its children.
+            // TODO: since this is newly created node, its schemaIdx actually
+            // doesn't exist from the footer schema. Reusing the curSchemaIdx
+            // but potentially could have issue.
+            auto childrenRowType =
+                createRowType(children, isFileColumnNamesReadAsLowerCase());
+            std::vector<std::unique_ptr<ParquetTypeWithId::TypeWithId>>
+                rowChildren;
+            // In this legacy case, there is no middle layer between "array"
+            // node and the children nodes. Below creates this dummy middle
+            // layer to mimic the non-legacy case and fill the gap.
+            rowChildren.emplace_back(std::make_unique<ParquetTypeWithId>(
+                childrenRowType,
+                std::move(children),
+                curSchemaIdx,
+                maxSchemaElementIdx,
+                ParquetTypeWithId::kNonLeaf,
+                "dummy",
+                std::nullopt,
+                std::nullopt,
+                maxRepeat,
+                maxDefine,
+                isOptional,
+                isRepeated));
+            auto res = std::make_unique<ParquetTypeWithId>(
+                TypeFactory<TypeKind::ARRAY>::create(childrenRowType),
+                std::move(rowChildren),
+                curSchemaIdx,
+                maxSchemaElementIdx,
+                ParquetTypeWithId::kNonLeaf, // columnIdx,
+                std::move(name),
+                std::nullopt,
+                std::nullopt,
+                maxRepeat,
+                maxDefine,
+                isOptional,
+                isRepeated);
+            return res;
+          }
         } else if (
             schema[parentSchemaIdx].converted_type ==
                 thrift::ConvertedType::MAP ||
@@ -374,7 +444,9 @@ std::unique_ptr<ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
               std::nullopt,
               std::nullopt,
               maxRepeat,
-              maxDefine);
+              maxDefine,
+              isOptional,
+              isRepeated);
         }
       } else {
         // Row type
@@ -389,7 +461,9 @@ std::unique_ptr<ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
             std::nullopt,
             std::nullopt,
             maxRepeat,
-            maxDefine);
+            maxDefine,
+            isOptional,
+            isRepeated);
       }
     }
   } else { // leaf node
@@ -415,6 +489,8 @@ std::unique_ptr<ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
         logicalType_,
         maxRepeat,
         maxDefine,
+        isOptional,
+        isRepeated,
         precision,
         scale,
         type_length);
@@ -430,12 +506,14 @@ std::unique_ptr<ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
           std::move(children),
           curSchemaIdx,
           maxSchemaElementIdx,
-          columnIdx++,
+          columnIdx - 1, // was already incremented for leafTypePtr
           std::move(name),
           std::nullopt,
           std::nullopt,
           maxRepeat,
-          maxDefine - 1);
+          maxDefine - 1,
+          isOptional,
+          isRepeated);
     }
     return leafTypePtr;
   }
@@ -570,7 +648,7 @@ TypePtr ReaderBase::convertType(
       case thrift::Type::type::INT64:
         return BIGINT();
       case thrift::Type::type::INT96:
-        return DOUBLE(); // TODO: Lose precision
+        return TIMESTAMP(); // INT96 only maps to a timestamp
       case thrift::Type::type::FLOAT:
         return REAL();
       case thrift::Type::type::DOUBLE:
@@ -631,6 +709,9 @@ int64_t ReaderBase::rowGroupUncompressedSize(
     int32_t rowGroupIndex,
     const dwio::common::TypeWithId& type) const {
   if (type.column() != ParquetTypeWithId::kNonLeaf) {
+    VELOX_CHECK_LT(rowGroupIndex, fileMetaData_->row_groups.size());
+    VELOX_CHECK_LT(
+        type.column(), fileMetaData_->row_groups[rowGroupIndex].columns.size());
     return fileMetaData_->row_groups[rowGroupIndex]
         .columns[type.column()]
         .meta_data.total_uncompressed_size;
@@ -680,14 +761,19 @@ class ParquetRowReader::Impl {
       return; // TODO
     }
     ParquetParams params(
-        pool_, columnReaderStats_, readerBase_->fileMetaData());
-    auto columnSelector = std::make_shared<ColumnSelector>(
-        ColumnSelector::apply(options_.getSelector(), readerBase_->schema()));
+        pool_,
+        columnReaderStats_,
+        readerBase_->fileMetaData(),
+        readerBase->sessionTimezone());
+    requestedType_ = options_.requestedType() ? options_.requestedType()
+                                              : readerBase_->schema();
     columnReader_ = ParquetColumnReader::build(
-        columnSelector->getSchemaWithId(),
+        requestedType_,
         readerBase_->schemaWithId(), // Id is schema id
         params,
         *options_.getScanSpec());
+    columnReader_->setFillMutatedOutputRows(
+        options_.getRowNumberColumnInfo().has_value());
 
     filterRowGroups();
     if (!rowGroupIds_.empty()) {
@@ -755,13 +841,23 @@ class ParquetRowReader::Impl {
       uint64_t size,
       velox::VectorPtr& result,
       const dwio::common::Mutation* mutation) {
-    VELOX_DCHECK(!options_.getAppendRowNumberColumn());
     auto rowsToRead = nextReadSize(size);
     if (rowsToRead == kAtEnd) {
       return 0;
     }
     VELOX_DCHECK_GT(rowsToRead, 0);
-    columnReader_->next(rowsToRead, result, mutation);
+    if (!options_.getRowNumberColumnInfo().has_value()) {
+      columnReader_->next(rowsToRead, result, mutation);
+    } else {
+      readWithRowNumber(
+          columnReader_,
+          options_,
+          nextRowNumber(),
+          rowsToRead,
+          mutation,
+          result);
+    }
+
     currentRowInGroup_ += rowsToRead;
     return rowsToRead;
   }
@@ -821,7 +917,7 @@ class ParquetRowReader::Impl {
 
   std::unique_ptr<dwio::common::SelectiveColumnReader> columnReader_;
 
-  RowTypePtr requestedType_;
+  TypePtr requestedType_;
 
   dwio::common::ColumnReaderStatistics columnReaderStats_;
 };

@@ -75,6 +75,10 @@ class MemoryArbitrator {
     /// timeout.
     uint64_t memoryReclaimWaitMs{0};
 
+    /// If true, it allows memory arbitrator to reclaim used memory cross query
+    /// memory pools.
+    bool globalArbitrationEnabled{false};
+
     /// Provided by the query system to validate the state after a memory pool
     /// enters arbitration if not null. For instance, Prestissimo provides
     /// callback to check if a memory arbitration request is issued from a
@@ -128,7 +132,7 @@ class MemoryArbitrator {
   /// Invoked by the memory manager to allocate up to 'targetBytes' of free
   /// memory capacity without triggering memory arbitration. The function will
   /// grow the memory pool's capacity based on the free available memory
-  /// capacity in the arbitrator, and returns the actual growed capacity in
+  /// capacity in the arbitrator, and returns the actual grown capacity in
   /// bytes.
   virtual uint64_t growCapacity(MemoryPool* pool, uint64_t bytes) = 0;
 
@@ -246,6 +250,11 @@ class MemoryArbitrator {
   /// Returns the debug string of this memory arbitrator.
   virtual std::string toString() const = 0;
 
+  /// Enables/disables global arbitration accordingly.
+  void testingSetGlobalArbitration(bool enableGlobalArbitration) {
+    *const_cast<bool*>(&globalArbitrationEnabled_) = enableGlobalArbitration;
+  }
+
  protected:
   explicit MemoryArbitrator(const Config& config)
       : capacity_(config.capacity),
@@ -253,16 +262,25 @@ class MemoryArbitrator {
         memoryPoolReservedCapacity_(config.memoryPoolReservedCapacity),
         memoryPoolTransferCapacity_(config.memoryPoolTransferCapacity),
         memoryReclaimWaitMs_(config.memoryReclaimWaitMs),
+        globalArbitrationEnabled_(config.globalArbitrationEnabled),
         arbitrationStateCheckCb_(config.arbitrationStateCheckCb),
         checkUsageLeak_(config.checkUsageLeak) {
     VELOX_CHECK_LE(reservedCapacity_, capacity_);
   }
+
+  /// Helper utilities used by the memory arbitrator implementations to call
+  /// protected methods of memory pool.
+  static bool
+  growPool(MemoryPool* pool, uint64_t growBytes, uint64_t reservationBytes);
+
+  static uint64_t shrinkPool(MemoryPool* pool, uint64_t targetBytes);
 
   const uint64_t capacity_;
   const uint64_t reservedCapacity_;
   const uint64_t memoryPoolReservedCapacity_;
   const uint64_t memoryPoolTransferCapacity_;
   const uint64_t memoryReclaimWaitMs_;
+  const bool globalArbitrationEnabled_;
   const MemoryArbitrationStateCheckCB arbitrationStateCheckCb_;
   const bool checkUsageLeak_;
 };
@@ -317,13 +335,15 @@ class MemoryReclaimer {
 
     bool operator==(const Stats& other) const;
     bool operator!=(const Stats& other) const;
+    Stats& operator+=(const Stats& other);
   };
 
   virtual ~MemoryReclaimer() = default;
 
   static std::unique_ptr<MemoryReclaimer> create();
 
-  static uint64_t run(const std::function<uint64_t()>& func, Stats& stats);
+  /// Invoked memory reclaim function from 'pool' and record execution 'stats'.
+  static uint64_t run(const std::function<int64_t()>& func, Stats& stats);
 
   /// Invoked by the memory arbitrator before entering the memory arbitration
   /// processing. The default implementation does nothing but user can override
@@ -379,6 +399,20 @@ class MemoryReclaimer {
   MemoryReclaimer() = default;
 };
 
+/// Helper class used to measure the memory bytes reclaimed from a memory pool
+/// by a memory reclaim function.
+class ScopedReclaimedBytesRecorder {
+ public:
+  ScopedReclaimedBytesRecorder(MemoryPool* pool, int64_t* reclaimedBytes);
+
+  ~ScopedReclaimedBytesRecorder();
+
+ private:
+  MemoryPool* const pool_;
+  int64_t* const reclaimedBytes_;
+  const int64_t reservedBytesBeforeReclaim_;
+};
+
 /// The object is used to set/clear non-reclaimable section of an operation in
 /// the middle of its execution. It allows the memory arbitrator to reclaim
 /// memory from a running operator which is waiting for memory arbitration.
@@ -432,6 +466,14 @@ struct MemoryArbitrationContext {
 class ScopedMemoryArbitrationContext {
  public:
   explicit ScopedMemoryArbitrationContext(const MemoryPool* requestor);
+
+  // Can be used to restore a previously captured MemoryArbitrationContext.
+  // contextToRestore can be nullptr if there was no context at the time it was
+  // captured, in which case arbitrationCtx is unchanged upon
+  // contruction/destruction of this object.
+  explicit ScopedMemoryArbitrationContext(
+      const MemoryArbitrationContext* contextToRestore);
+
   ~ScopedMemoryArbitrationContext();
 
  private:
@@ -441,7 +483,7 @@ class ScopedMemoryArbitrationContext {
 
 /// Returns the memory arbitration context set by a per-thread local variable if
 /// the running thread is under memory arbitration processing.
-MemoryArbitrationContext* memoryArbitrationContext();
+const MemoryArbitrationContext* memoryArbitrationContext();
 
 /// Returns true if the running thread is under memory arbitration or not.
 bool underMemoryArbitration();

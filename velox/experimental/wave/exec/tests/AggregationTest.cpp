@@ -49,6 +49,7 @@ class AggregationTest : public OperatorTestBase {
   }
 
   void SetUp() override {
+    OperatorTestBase::SetUp();
     if (int device; cudaGetDevice(&device) != cudaSuccess) {
       GTEST_SKIP() << "No CUDA detected, skipping all tests";
     }
@@ -227,9 +228,3 @@ TEST_F(AggregationTest, tpchQ1) {
 
 } // namespace
 } // namespace facebook::velox::wave
-
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  folly::Init follyInit(&argc, &argv);
-  return RUN_ALL_TESTS();
-}

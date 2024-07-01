@@ -19,13 +19,13 @@
 #include <gtest/gtest.h>
 #include <unordered_set>
 
-#include "velox/exec/fuzzer/DuckQueryRunner.h"
 #include "velox/exec/fuzzer/WindowFuzzerRunner.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/functions/prestosql/fuzzer/ApproxDistinctInputGenerator.h"
 #include "velox/functions/prestosql/fuzzer/ApproxDistinctResultVerifier.h"
 #include "velox/functions/prestosql/fuzzer/ApproxPercentileInputGenerator.h"
 #include "velox/functions/prestosql/fuzzer/MinMaxInputGenerator.h"
+#include "velox/functions/prestosql/fuzzer/WindowOffsetInputGenerator.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/functions/prestosql/window/WindowFunctionsRegistration.h"
 
@@ -49,6 +49,12 @@ DEFINE_string(
     "source of truth. Otherwise, use DuckDB. Example: "
     "--presto_url=http://127.0.0.1:8080");
 
+DEFINE_uint32(
+    req_timeout_ms,
+    1000,
+    "Timeout in milliseconds for HTTP requests made to reference DB, "
+    "such as Presto. Example: --req_timeout_ms=2000");
+
 namespace facebook::velox::exec::test {
 namespace {
 
@@ -62,6 +68,10 @@ getCustomInputGenerators() {
       {"approx_distinct", std::make_shared<ApproxDistinctInputGenerator>()},
       {"approx_set", std::make_shared<ApproxDistinctInputGenerator>()},
       {"approx_percentile", std::make_shared<ApproxPercentileInputGenerator>()},
+      {"lead", std::make_shared<WindowOffsetInputGenerator>(1)},
+      {"lag", std::make_shared<WindowOffsetInputGenerator>(1)},
+      {"nth_value", std::make_shared<WindowOffsetInputGenerator>(1)},
+      {"ntile", std::make_shared<WindowOffsetInputGenerator>(0)},
   };
 }
 
@@ -89,6 +99,7 @@ int main(int argc, char** argv) {
   static const std::unordered_set<std::string> skipFunctions = {
       // Skip internal functions used only for result verifications.
       "$internal$count_distinct",
+      "$internal$array_agg",
       // https://github.com/facebookincubator/velox/issues/3493
       "stddev_pop",
       // Lambda functions are not supported yet.
@@ -169,6 +180,7 @@ int main(int argc, char** argv) {
       facebook::velox::VectorFuzzer::Options::TimestampPrecision::kMilliSeconds;
   return Runner::run(
       initialSeed,
-      setupReferenceQueryRunner(FLAGS_presto_url, "window_fuzzer"),
+      setupReferenceQueryRunner(
+          FLAGS_presto_url, "window_fuzzer", FLAGS_req_timeout_ms),
       options);
 }

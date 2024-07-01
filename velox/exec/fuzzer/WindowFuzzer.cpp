@@ -17,6 +17,7 @@
 #include "velox/exec/fuzzer/WindowFuzzer.h"
 
 #include <boost/random/uniform_int_distribution.hpp>
+#include "velox/common/base/Portability.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 
@@ -28,15 +29,6 @@ DEFINE_bool(
 namespace facebook::velox::exec::test {
 
 namespace {
-
-void logVectors(const std::vector<RowVectorPtr>& vectors) {
-  for (auto i = 0; i < vectors.size(); ++i) {
-    VLOG(1) << "Input batch " << i << ":";
-    for (auto j = 0; j < vectors[i]->size(); ++j) {
-      VLOG(1) << "\tRow " << j << ": " << vectors[i]->toString(j);
-    }
-  }
-}
 
 bool supportIgnoreNulls(const std::string& name) {
   // Below are all functions that support ignore nulls. Aggregation functions in
@@ -166,8 +158,7 @@ std::string WindowFuzzer::generateOrderByClause(
       frame << ", ";
     }
     frame << sortingKeysAndOrders[i].key_ << " "
-          << sortingKeysAndOrders[i].order_ << " "
-          << sortingKeysAndOrders[i].nullsOrder_;
+          << sortingKeysAndOrders[i].sortOrder_.toString();
   }
   return frame.str();
 }
@@ -193,11 +184,10 @@ WindowFuzzer::generateSortingKeysAndOrders(
     std::vector<TypePtr>& types) {
   auto keys = generateSortingKeys(prefix, names, types);
   std::vector<SortingKeyAndOrder> results;
-  // TODO: allow randomly generating orders.
   for (auto i = 0; i < keys.size(); ++i) {
-    std::string order = "asc";
-    std::string nullsOrder = "nulls last";
-    results.push_back(SortingKeyAndOrder(keys[i], order, nullsOrder));
+    auto asc = vectorFuzzer_.coinToss(0.5);
+    auto nullsFirst = vectorFuzzer_.coinToss(0.5);
+    results.emplace_back(keys[i], core::SortOrder(asc, nullsFirst));
   }
   return results;
 }
@@ -245,13 +235,12 @@ void WindowFuzzer::go() {
     }
     const auto partitionKeys = generateSortingKeys("p", argNames, argTypes);
     const auto [frameClause, isRowsFrame] = generateFrameClause();
-    const auto input =
-        generateInputDataWithRowNumber(argNames, argTypes, signature);
+    const auto input = generateInputDataWithRowNumber(
+        argNames, argTypes, partitionKeys, signature);
     // If the function is order-dependent or uses "rows" frame, sort all input
     // rows by row_number additionally.
     if (requireSortedInput || isRowsFrame) {
-      sortingKeysAndOrders.push_back(
-          SortingKeyAndOrder("row_number", "asc", "nulls last"));
+      sortingKeysAndOrders.emplace_back("row_number", core::kAscNullsLast);
       ++stats_.numSortedInputs;
     }
 
@@ -301,20 +290,16 @@ void WindowFuzzer::testAlternativePlans(
     const std::vector<RowVectorPtr>& input,
     bool customVerification,
     const std::shared_ptr<ResultVerifier>& customVerifier,
-    const velox::test::ResultOrError& expected) {
+    const velox::fuzzer::ResultOrError& expected) {
   std::vector<AggregationFuzzerBase::PlanWithSplits> plans;
 
   std::vector<std::string> allKeys;
   for (const auto& key : partitionKeys) {
-    allKeys.push_back(key + " NULLS FIRST");
+    allKeys.emplace_back(key + " NULLS FIRST");
   }
   for (const auto& keyAndOrder : sortingKeysAndOrders) {
-    allKeys.push_back(folly::to<std::string>(
-        keyAndOrder.key_,
-        " ",
-        keyAndOrder.order_,
-        " ",
-        keyAndOrder.nullsOrder_));
+    allKeys.emplace_back(fmt::format(
+        "{} {}", keyAndOrder.key_, keyAndOrder.sortOrder_.toString()));
   }
 
   // Streaming window from values.
@@ -333,8 +318,14 @@ void WindowFuzzer::testAlternativePlans(
   auto directory = exec::test::TempDirectoryPath::create();
   const auto inputRowType = asRowType(input[0]->type());
   if (isTableScanSupported(inputRowType)) {
-    auto splits = makeSplits(input, directory->getPath());
+    auto splits = makeSplits(input, directory->getPath(), writerPool_);
 
+// There is a known issue where LocalPartition will send DictionaryVectors
+// with the same underlying base Vector to multiple threads.  This triggers
+// TSAN to report data races, particularly if that base Vector is from the
+// TableScan and reused.  Don't run these tests when TSAN is enabled to avoid
+// the false negatives.
+#ifndef TSAN_BUILD
     plans.push_back(
         {PlanBuilder()
              .tableScan(inputRowType)
@@ -342,6 +333,7 @@ void WindowFuzzer::testAlternativePlans(
              .window({fmt::format("{} over ({})", functionCall, frame)})
              .planNode(),
          splits});
+#endif
 
     if (!allKeys.empty()) {
       plans.push_back(
@@ -400,7 +392,7 @@ bool WindowFuzzer::verifyWindow(
     persistReproInfo({{plan, {}}}, reproPersistPath_);
   }
 
-  velox::test::ResultOrError resultOrError;
+  velox::fuzzer::ResultOrError resultOrError;
   try {
     resultOrError = execute(plan);
     if (resultOrError.exceptionPtr) {

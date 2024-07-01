@@ -91,7 +91,8 @@ class SplitReader {
   /// would be called only once per incoming split
   virtual void prepareSplit(
       std::shared_ptr<common::MetadataFilter> metadataFilter,
-      dwio::common::RuntimeStatistics& runtimeStats);
+      dwio::common::RuntimeStatistics& runtimeStats,
+      const std::shared_ptr<HiveColumnHandle>& rowIndexColumn);
 
   virtual uint64_t next(uint64_t size, VectorPtr& output);
 
@@ -107,12 +108,16 @@ class SplitReader {
 
   bool allPrefetchIssued() const;
 
+  void setConnectorQueryCtx(const ConnectorQueryCtx* connectorQueryCtx);
+
   std::string toString() const;
 
  protected:
   /// Create the dwio::common::Reader object baseReader_, which will be used to
   /// read the data file's metadata and schema
-  void createReader();
+  void createReader(
+      std::shared_ptr<common::MetadataFilter> metadataFilter,
+      const std::shared_ptr<HiveColumnHandle>& rowIndexColumn);
 
   /// Check if the hiveSplit_ is empty. The split is considered empty when
   ///   1) The data file is missing but the user chooses to ignore it
@@ -124,13 +129,16 @@ class SplitReader {
 
   /// Create the dwio::common::RowReader object baseRowReader_, which owns the
   /// ColumnReaders that will be used to read the data
-  void createRowReader(std::shared_ptr<common::MetadataFilter> metadataFilter);
+  void createRowReader();
 
   /// Different table formats may have different meatadata columns.
   /// This function will be used to update the scanSpec for these columns.
   virtual std::vector<TypePtr> adaptColumns(
       const RowTypePtr& fileType,
       const std::shared_ptr<const velox::RowType>& tableSchema);
+
+  void setRowIndexColumn(
+      const std::shared_ptr<HiveColumnHandle>& rowIndexColumn);
 
   void setPartitionValue(
       common::ScanSpec* spec,
@@ -142,7 +150,7 @@ class SplitReader {
   const std::unordered_map<
       std::string,
       std::shared_ptr<HiveColumnHandle>>* const partitionKeys_;
-  const ConnectorQueryCtx* const connectorQueryCtx_;
+  const ConnectorQueryCtx* connectorQueryCtx_;
   const std::shared_ptr<const HiveConfig> hiveConfig_;
 
   const RowTypePtr readerOutputType_;

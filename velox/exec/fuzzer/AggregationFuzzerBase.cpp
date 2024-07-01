@@ -19,13 +19,12 @@
 #include "velox/common/base/Fs.h"
 #include "velox/common/base/VeloxException.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
-#include "velox/dwio/dwrf/reader/DwrfReader.h"
 #include "velox/dwio/dwrf/writer/Writer.h"
 #include "velox/exec/fuzzer/DuckQueryRunner.h"
 #include "velox/exec/fuzzer/PrestoQueryRunner.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 #include "velox/expression/SignatureBinder.h"
-#include "velox/expression/tests/utils/ArgumentTypeFuzzer.h"
+#include "velox/expression/fuzzer/ArgumentTypeFuzzer.h"
 #include "velox/vector/VectorSaver.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 
@@ -198,7 +197,7 @@ AggregationFuzzerBase::pickSignature() {
     const auto& signatureTemplate =
         signatureTemplates_[idx - signatures_.size()];
     signature.name = signatureTemplate.name;
-    velox::test::ArgumentTypeFuzzer typeFuzzer(
+    velox::fuzzer::ArgumentTypeFuzzer typeFuzzer(
         *signatureTemplate.signature, rng_);
     VELOX_CHECK(typeFuzzer.fuzzArgumentTypes(FLAGS_max_num_varargs));
     signature.args = typeFuzzer.argumentTypes();
@@ -300,6 +299,7 @@ std::vector<RowVectorPtr> AggregationFuzzerBase::generateInputData(
 std::vector<RowVectorPtr> AggregationFuzzerBase::generateInputDataWithRowNumber(
     std::vector<std::string> names,
     std::vector<TypePtr> types,
+    const std::vector<std::string>& partitionKeys,
     const CallableSignature& signature) {
   names.push_back("row_number");
   types.push_back(BIGINT());
@@ -307,9 +307,16 @@ std::vector<RowVectorPtr> AggregationFuzzerBase::generateInputDataWithRowNumber(
   auto generator = findInputGenerator(signature);
 
   std::vector<RowVectorPtr> input;
-  auto size = vectorFuzzer_.getOptions().vectorSize;
+  vector_size_t size = vectorFuzzer_.getOptions().vectorSize;
   velox::test::VectorMaker vectorMaker{pool_.get()};
   int64_t rowNumber = 0;
+
+  std::unordered_set<std::string> partitionKeySet;
+  partitionKeySet.reserve(partitionKeys.size());
+  for (auto partitionKey : partitionKeys) {
+    partitionKeySet.insert(partitionKey);
+  }
+
   for (auto j = 0; j < FLAGS_num_batches; ++j) {
     std::vector<VectorPtr> children;
 
@@ -318,8 +325,21 @@ std::vector<RowVectorPtr> AggregationFuzzerBase::generateInputDataWithRowNumber(
           generator->generate(signature.args, vectorFuzzer_, rng_, pool_.get());
     }
 
+    // Number of partitions is randomly generated and is at least 1.
+    auto numPartitions = size ? randInt(1, size) : 1;
+    auto indices = vectorFuzzer_.fuzzIndices(size, numPartitions);
+    auto nulls = vectorFuzzer_.fuzzNulls(size);
     for (auto i = children.size(); i < types.size() - 1; ++i) {
-      children.push_back(vectorFuzzer_.fuzz(types[i], size));
+      if (partitionKeySet.find(names[i]) != partitionKeySet.end()) {
+        // The partition keys are built with a dictionary over a smaller set of
+        // values. This is done to introduce some repetition of key values for
+        // windowing.
+        auto baseVector = vectorFuzzer_.fuzz(types[i], numPartitions);
+        children.push_back(
+            BaseVector::wrapInDictionary(nulls, indices, size, baseVector));
+      } else {
+        children.push_back(vectorFuzzer_.fuzz(types[i], size));
+      }
     }
     children.push_back(vectorMaker.flatVector<int64_t>(
         size, [&](auto /*row*/) { return rowNumber++; }));
@@ -331,12 +351,6 @@ std::vector<RowVectorPtr> AggregationFuzzerBase::generateInputDataWithRowNumber(
   }
 
   return input;
-}
-
-// static
-exec::Split AggregationFuzzerBase::makeSplit(const std::string& filePath) {
-  return exec::Split{std::make_shared<connector::hive::HiveConnectorSplit>(
-      kHiveConnectorId, filePath, dwio::common::FileFormat::DWRF)};
 }
 
 AggregationFuzzerBase::PlanWithSplits AggregationFuzzerBase::deserialize(
@@ -386,7 +400,20 @@ void AggregationFuzzerBase::printSignatureStats() {
   }
 }
 
-velox::test::ResultOrError AggregationFuzzerBase::execute(
+void AggregationFuzzerBase::logVectors(
+    const std::vector<RowVectorPtr>& vectors) {
+  if (!VLOG_IS_ON(1)) {
+    return;
+  }
+  for (auto i = 0; i < vectors.size(); ++i) {
+    VLOG(1) << "Input batch " << i << ":";
+    for (auto j = 0; j < vectors[i]->size(); ++j) {
+      VLOG(1) << "\tRow " << j << ": " << vectors[i]->toString(j);
+    }
+  }
+}
+
+velox::fuzzer::ResultOrError AggregationFuzzerBase::execute(
     const core::PlanNodePtr& plan,
     const std::vector<exec::Split>& splits,
     bool injectSpill,
@@ -395,7 +422,7 @@ velox::test::ResultOrError AggregationFuzzerBase::execute(
   LOG(INFO) << "Executing query plan: " << std::endl
             << plan->toString(true, true);
 
-  velox::test::ResultOrError resultOrError;
+  velox::fuzzer::ResultOrError resultOrError;
   try {
     std::shared_ptr<TempDirectoryPath> spillDirectory;
     AssertQueryBuilder builder(plan);
@@ -511,7 +538,7 @@ void AggregationFuzzerBase::testPlan(
     bool abandonPartial,
     bool customVerification,
     const std::vector<std::shared_ptr<ResultVerifier>>& customVerifiers,
-    const velox::test::ResultOrError& expected,
+    const velox::fuzzer::ResultOrError& expected,
     int32_t maxDrivers) {
   auto actual = execute(
       planWithSplits.plan,
@@ -523,10 +550,10 @@ void AggregationFuzzerBase::testPlan(
 }
 
 void AggregationFuzzerBase::compare(
-    const velox::test::ResultOrError& actual,
+    const velox::fuzzer::ResultOrError& actual,
     bool customVerification,
     const std::vector<std::shared_ptr<ResultVerifier>>& customVerifiers,
-    const velox::test::ResultOrError& expected) {
+    const velox::fuzzer::ResultOrError& expected) {
   // Compare results or exceptions (if any). Fail is anything is different.
   if (FLAGS_enable_oom_injection) {
     // If OOM injection is enabled and we've made it this far and the test
@@ -537,7 +564,8 @@ void AggregationFuzzerBase::compare(
   // Compare results or exceptions (if any). Fail if anything is different.
   if (expected.exceptionPtr || actual.exceptionPtr) {
     // Throws in case exceptions are not compatible.
-    velox::test::compareExceptions(expected.exceptionPtr, actual.exceptionPtr);
+    velox::fuzzer::compareExceptions(
+        expected.exceptionPtr, actual.exceptionPtr);
     return;
   }
 
@@ -592,43 +620,6 @@ void writeToFile(
   writer.close();
 }
 } // namespace
-
-// Sometimes we generate zero-column input of type ROW({}) or a column of type
-// UNKNOWN(). Such data cannot be written to a file and therefore cannot
-// be tested with TableScan.
-bool isTableScanSupported(const TypePtr& type) {
-  if (type->kind() == TypeKind::ROW && type->size() == 0) {
-    return false;
-  }
-  if (type->kind() == TypeKind::UNKNOWN) {
-    return false;
-  }
-  if (type->kind() == TypeKind::HUGEINT) {
-    return false;
-  }
-
-  for (auto i = 0; i < type->size(); ++i) {
-    if (!isTableScanSupported(type->childAt(i))) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-std::vector<exec::Split> AggregationFuzzerBase::makeSplits(
-    const std::vector<RowVectorPtr>& inputs,
-    const std::string& path) {
-  std::vector<exec::Split> splits;
-  auto writerPool = rootPool_->addAggregateChild("writer");
-  for (auto i = 0; i < inputs.size(); ++i) {
-    const std::string filePath = fmt::format("{}/{}", path, i);
-    writeToFile(filePath, inputs[i], writerPool.get());
-    splits.push_back(makeSplit(filePath));
-  }
-
-  return splits;
-}
 
 void AggregationFuzzerBase::Stats::updateReferenceQueryStats(
     AggregationFuzzerBase::ReferenceQueryErrorCode errorCode) {
@@ -787,7 +778,8 @@ void persistReproInfo(
 
 std::unique_ptr<ReferenceQueryRunner> setupReferenceQueryRunner(
     const std::string& prestoUrl,
-    const std::string& runnerName) {
+    const std::string& runnerName,
+    const uint32_t& reqTimeoutMs) {
   if (prestoUrl.empty()) {
     auto duckQueryRunner = std::make_unique<DuckQueryRunner>();
     duckQueryRunner->disableAggregateFunctions({
@@ -802,7 +794,10 @@ std::unique_ptr<ReferenceQueryRunner> setupReferenceQueryRunner(
     LOG(INFO) << "Using DuckDB as the reference DB.";
     return duckQueryRunner;
   } else {
-    return std::make_unique<PrestoQueryRunner>(prestoUrl, runnerName);
+    return std::make_unique<PrestoQueryRunner>(
+        prestoUrl,
+        runnerName,
+        static_cast<std::chrono::milliseconds>(reqTimeoutMs));
     LOG(INFO) << "Using Presto as the reference DB.";
   }
 }
